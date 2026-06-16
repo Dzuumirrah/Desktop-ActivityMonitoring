@@ -4,16 +4,15 @@ Timeline page: chronological session blocks with date navigation.
 
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QPainter, QBrush, QFont
+from PySide6.QtCore import Qt, QDate
+from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont
 from PySide6.QtWidgets import (
     QDateEdit, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
-from PySide6.QtCore import QDate
 
 from core.database import get_db
-from gui.widgets.charts import COLORS, _seconds_to_hms
+from gui.widgets.charts import COLORS, _seconds_to_hms, _draw_placeholder
 
 
 # ── Timeline drawing widget ───────────────────────────────────────────────────
@@ -30,7 +29,7 @@ class TimelineCanvas(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._rows: list[tuple[str, list[dict]]] = []   # [(app, [session…]),…]
+        self._rows: list[tuple[str, list[dict]]] = []
         self._day_start: datetime = datetime.now().replace(
             hour=0, minute=0, second=0, microsecond=0
         )
@@ -39,7 +38,6 @@ class TimelineCanvas(QWidget):
 
     def set_data(self, sessions: list[dict], day_start: datetime) -> None:
         self._day_start = day_start
-        # Group by process_name, keep order of first appearance
         order: list[str] = []
         groups: dict[str, list[dict]] = {}
         for s in sorted(sessions, key=lambda x: x.get("start_time", "")):
@@ -54,10 +52,15 @@ class TimelineCanvas(QWidget):
         self.update()
 
     def paintEvent(self, event) -> None:  # noqa: N802
-        if not self._rows:
-            return
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+
+        if not self._rows:
+            _draw_placeholder(p, self.width(), self.height(),
+                              "Switch between apps to start recording sessions.\n"
+                              "They will appear here as a timeline.")
+            p.end()
+            return
 
         W = self.width()
         day_sec = 86_400
@@ -66,7 +69,6 @@ class TimelineCanvas(QWidget):
         font_small = QFont(); font_small.setPointSize(8)
         font_label = QFont(); font_label.setPointSize(9)
 
-        # Hour grid lines
         p.setFont(font_small)
         for hr in range(0, 25, 2):
             x = self.LABEL_W + int(draw_w * (hr * 3600) / day_sec)
@@ -77,12 +79,10 @@ class TimelineCanvas(QWidget):
                 p.drawText(x + 2, self.height() - 18, 32, 16,
                            Qt.AlignLeft, f"{hr:02d}h")
 
-        # Session rows
         for row_idx, (app, sessions) in enumerate(self._rows):
             y_top = row_idx * self.ROW_H + 4
             color = self._color_map[app]
 
-            # App label
             p.setFont(font_label)
             p.setPen(QColor("#cdd6f4"))
             p.drawText(2, y_top, self.LABEL_W - 6, self.ROW_H - 8,
@@ -131,12 +131,10 @@ class TimelinePage(QWidget):
         root.setContentsMargins(24, 16, 24, 16)
         root.setSpacing(8)
 
-        # Header
         title = QLabel("Timeline")
         title.setStyleSheet("color: #cdd6f4; font-size: 20px; font-weight: bold;")
         root.addWidget(title)
 
-        # Date nav bar
         nav = QHBoxLayout()
         self._prev_btn = QPushButton("◀ Prev")
         self._prev_btn.setFixedWidth(80)
@@ -156,7 +154,6 @@ class TimelinePage(QWidget):
         nav.addStretch()
         root.addLayout(nav)
 
-        # Scrollable canvas
         self._canvas = TimelineCanvas()
         scroll = QScrollArea()
         scroll.setWidget(self._canvas)
@@ -165,8 +162,6 @@ class TimelinePage(QWidget):
             "QScrollArea { border: none; background: #1e1e2e; }"
         )
         root.addWidget(scroll)
-
-    # ── Navigation ────────────────────────────────────────────────────────────
 
     def _prev_day(self) -> None:
         self._date_edit.setDate(self._date_edit.date().addDays(-1))
@@ -179,8 +174,6 @@ class TimelinePage(QWidget):
     def _on_date_changed(self, qdate: QDate) -> None:
         self._selected_date = datetime(qdate.year(), qdate.month(), qdate.day()).date()
         self.refresh()
-
-    # ── Refresh ───────────────────────────────────────────────────────────────
 
     def refresh(self) -> None:
         d          = self._selected_date

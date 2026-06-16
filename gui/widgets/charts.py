@@ -5,11 +5,9 @@ Built on pyqtgraph for performance; falls back to a plain label if unavailable.
 
 from __future__ import annotations
 
-from typing import Sequence
-
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFont
-from PySide6.QtWidgets import QWidget, QSizePolicy, QVBoxLayout, QLabel
+from PySide6.QtWidgets import QWidget, QSizePolicy
 
 # ── Color palette (dark-friendly) ─────────────────────────────────────────────
 ACCENT   = QColor("#4f8ef7")
@@ -24,6 +22,10 @@ COLORS   = [
     QColor("#74c7ec"),
 ]
 
+_PLACEHOLDER_BG  = QColor("#262637")
+_PLACEHOLDER_FG  = QColor("#45475a")
+_PLACEHOLDER_TXT = QColor("#585b70")
+
 
 def _seconds_to_hms(sec: int) -> str:
     h, m = divmod(sec, 3600)
@@ -33,6 +35,33 @@ def _seconds_to_hms(sec: int) -> str:
     if m:
         return f"{m}m {s:02d}s"
     return f"{s}s"
+
+
+def _draw_placeholder(painter: QPainter, rect_w: int, rect_h: int, label: str) -> None:
+    """
+    Draw a dashed-border placeholder with centred hint text.
+    Called by chart widgets when they have no data yet.
+    """
+    p = painter
+    margin = 12
+
+    # Dashed border
+    pen = QPen(_PLACEHOLDER_FG, 1, Qt.DashLine)
+    p.setPen(pen)
+    p.setBrush(QBrush(_PLACEHOLDER_BG))
+    p.drawRoundedRect(margin, margin, rect_w - margin * 2, rect_h - margin * 2, 8, 8)
+
+    # Icon
+    icon_font = QFont("Segoe UI", 24)
+    p.setFont(icon_font)
+    p.setPen(_PLACEHOLDER_FG)
+    p.drawText(0, 0, rect_w, rect_h - 24, Qt.AlignCenter, "📊")
+
+    # Caption
+    txt_font = QFont("Segoe UI", 9)
+    p.setFont(txt_font)
+    p.setPen(_PLACEHOLDER_TXT)
+    p.drawText(0, 24, rect_w, rect_h, Qt.AlignCenter, label)
 
 
 # ── Bar Chart ─────────────────────────────────────────────────────────────────
@@ -45,7 +74,7 @@ class BarChartWidget(QWidget):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._data: list[tuple[str, int]] = []   # [(label, value_sec), …]
+        self._data: list[tuple[str, int]] = []
         self.setMinimumHeight(200)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
@@ -55,10 +84,14 @@ class BarChartWidget(QWidget):
         self.update()
 
     def paintEvent(self, event) -> None:  # noqa: N802
-        if not self._data:
-            return
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+
+        if not self._data:
+            _draw_placeholder(p, self.width(), self.height(),
+                              "Top apps will appear here once\nactivity is detected")
+            p.end()
+            return
 
         W = self.width()
         H = self.height()
@@ -79,7 +112,6 @@ class BarChartWidget(QWidget):
             bar_w    = int(bar_area * val / max_val)
             color    = COLORS[i % len(COLORS)]
 
-            # Bar
             p.setBrush(QBrush(color))
             p.setPen(Qt.NoPen)
             p.drawRoundedRect(
@@ -88,7 +120,6 @@ class BarChartWidget(QWidget):
                 max(4, bar_w), int(bar_h), 3, 3
             )
 
-            # Label (left)
             p.setPen(FG_TEXT)
             p.drawText(
                 4, int(y_center - 8), label_w - 8, 18,
@@ -96,7 +127,6 @@ class BarChartWidget(QWidget):
                 label[:25],
             )
 
-            # Value (right)
             p.drawText(
                 int(label_w + bar_area + 12),
                 int(y_center - 8), value_w, 18,
@@ -123,10 +153,14 @@ class DailyBarChart(QWidget):
         self.update()
 
     def paintEvent(self, event) -> None:  # noqa: N802
-        if not self._data:
-            return
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+
+        if not self._data:
+            _draw_placeholder(p, self.width(), self.height(),
+                              "Daily activity will appear here\nonce sessions are recorded")
+            p.end()
+            return
 
         W       = self.width()
         H       = self.height()
@@ -150,8 +184,7 @@ class DailyBarChart(QWidget):
             p.setPen(Qt.NoPen)
             p.drawRoundedRect(x, y, bar_w, bh, 3, 3)
 
-            # Date label
-            label = str(row["activity_date"])[-5:]   # MM-DD
+            label = str(row["activity_date"])[-5:]
             p.setPen(FG_TEXT)
             p.drawText(x - 4, bottom + 4, bar_w + 8, 18,
                        Qt.AlignCenter, label)
@@ -177,6 +210,12 @@ class HourlyHeatmap(QWidget):
     def paintEvent(self, event) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+
+        if not self._data:
+            _draw_placeholder(p, self.width(), self.height(),
+                              "Hourly heatmap — no data yet")
+            p.end()
+            return
 
         W      = self.width()
         H      = self.height()
@@ -226,19 +265,16 @@ class StatCard(QWidget):
 
         W, H = self.width(), self.height()
 
-        # Card background
         p.setBrush(QBrush(BG_CARD))
         p.setPen(Qt.NoPen)
         p.drawRoundedRect(0, 0, W, H, 10, 10)
 
-        # Label
         lf = QFont()
         lf.setPointSize(9)
         p.setFont(lf)
         p.setPen(QColor("#7f849c"))
         p.drawText(0, 8, W, 20, Qt.AlignCenter, self._label)
 
-        # Value
         vf = QFont()
         vf.setPointSize(16)
         vf.setBold(True)

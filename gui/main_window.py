@@ -3,12 +3,12 @@ Main application window.
 Dark-themed, sidebar navigation, stacked page content area.
 """
 
-from PySide6.QtCore import Qt, QTimer, Signal, QObject
-from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QFont
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel,
-    QMainWindow, QPushButton, QStackedWidget,
-    QVBoxLayout, QWidget,
+    QMainWindow, QMenu, QPushButton, QStackedWidget,
+    QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
 from core.database import get_db
@@ -76,7 +76,27 @@ QGroupBox::title {
     left: 12px; padding: 0 4px;
 }
 QCalendarWidget { background: #313244; color: #cdd6f4; }
+QMenu {
+    background: #313244; color: #cdd6f4;
+    border: 1px solid #45475a;
+}
+QMenu::item:selected { background: #45475a; }
 """
+
+
+# ── Tray icon ─────────────────────────────────────────────────────────────────
+
+def _make_tray_icon() -> QIcon:
+    """Create a simple 32×32 "AM" icon for the system tray."""
+    pm = QPixmap(32, 32)
+    pm.fill(QColor("#4f8ef7"))
+    p = QPainter(pm)
+    p.setPen(QColor("#ffffff"))
+    f = QFont("Arial", 10, QFont.Bold)
+    p.setFont(f)
+    p.drawText(pm.rect(), Qt.AlignCenter, "AM")
+    p.end()
+    return QIcon(pm)
 
 
 # ── Sidebar button ────────────────────────────────────────────────────────────
@@ -88,6 +108,9 @@ class NavButton(QPushButton):
         self._label     = label
         self.setCheckable(True)
         self.setFixedHeight(48)
+        # BUG FIX: must call setText() so Qt actually renders the label.
+        # Overriding text() alone has no effect on what Qt displays.
+        self.setText(f"  {icon_text}  {label}")
         self._update_style(False)
 
     def _update_style(self, active: bool) -> None:
@@ -108,9 +131,6 @@ class NavButton(QPushButton):
         super().setChecked(checked)
         self._update_style(checked)
 
-    def text(self) -> str:
-        return f"  {self._icon_text}  {self._label}"
-
 
 # ── Main window ───────────────────────────────────────────────────────────────
 
@@ -120,12 +140,14 @@ class MainWindow(QMainWindow):
         self._tracker     = tracker
         self._sync_engine = sync_engine
         self._db          = get_db()
+        self._quit_for_real = False
 
         self.setWindowTitle("Activity Monitor")
         self.resize(1100, 720)
         self.setMinimumSize(900, 600)
 
         self._build_ui()
+        self._setup_tray()
         self._connect_tracker()
         logger.info("Main window created.")
 
@@ -138,7 +160,6 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        # Body row: sidebar + content
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
         body.setSpacing(0)
@@ -146,7 +167,6 @@ class MainWindow(QMainWindow):
         body.addWidget(self._build_content())
         root_layout.addLayout(body, stretch=1)
 
-        # Status bar at bottom
         self._status_bar = StatusBar(self._db, self)
         root_layout.addWidget(self._status_bar)
 
@@ -159,7 +179,6 @@ class MainWindow(QMainWindow):
         L.setContentsMargins(0, 0, 0, 0)
         L.setSpacing(0)
 
-        # App logo
         logo = QLabel("  📊 Activity\n      Monitor")
         logo.setStyleSheet(
             "color: #4f8ef7; font-size: 14px; font-weight: bold; "
@@ -172,7 +191,6 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet("background: #313244; border: none; max-height: 1px;")
         L.addWidget(sep)
 
-        # Nav buttons
         self._nav_buttons: list[NavButton] = []
         nav_items = [
             ("🏠", "Dashboard"),
@@ -188,7 +206,6 @@ class MainWindow(QMainWindow):
 
         L.addStretch()
 
-        # Tracker status indicator
         self._tracker_dot = QLabel("  🟢 Tracker running")
         self._tracker_dot.setStyleSheet(
             "color: #a6adc8; font-size: 10px; padding: 8px 12px;"
@@ -216,6 +233,37 @@ class MainWindow(QMainWindow):
         L.addWidget(self._stack)
         self._navigate("Dashboard")
         return wrapper
+
+    # ── System tray ───────────────────────────────────────────────────────────
+
+    def _setup_tray(self) -> None:
+        self._tray = QSystemTrayIcon(self)
+        self._tray.setIcon(_make_tray_icon())
+        self._tray.setToolTip("Activity Monitor")
+
+        menu = QMenu()
+        show_action = menu.addAction("Show Window")
+        show_action.triggered.connect(self._show_window)
+        menu.addSeparator()
+        quit_action = menu.addAction("Quit")
+        quit_action.triggered.connect(self._quit)
+
+        self._tray.setContextMenu(menu)
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+
+    def _show_window(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _on_tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason == QSystemTrayIcon.DoubleClick:
+            self._show_window()
+
+    def _quit(self) -> None:
+        self._quit_for_real = True
+        QApplication.quit()
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
@@ -267,9 +315,22 @@ class MainWindow(QMainWindow):
     # ── Clean shutdown ────────────────────────────────────────────────────────
 
     def closeEvent(self, event) -> None:
-        logger.info("Window closing – stopping tracker and sync.")
-        if self._tracker:
-            self._tracker.stop()
-        if self._sync_engine:
-            self._sync_engine.stop()
-        event.accept()
+        if self._quit_for_real:
+            # Real quit triggered from tray menu
+            logger.info("Window closing – stopping tracker and sync.")
+            if self._tracker:
+                self._tracker.stop()
+            if self._sync_engine:
+                self._sync_engine.stop()
+            self._tray.hide()
+            event.accept()
+        else:
+            # X button clicked: minimize to tray instead
+            event.ignore()
+            self.hide()
+            self._tray.showMessage(
+                "Activity Monitor",
+                "Still running in the background. Right-click the tray icon to quit.",
+                QSystemTrayIcon.Information,
+                3000,
+            )
