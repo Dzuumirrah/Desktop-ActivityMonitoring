@@ -29,7 +29,12 @@ class PrivacyManager:
 
     def __init__(self) -> None:
         mode = settings.get("privacy_mode", "full")
-        excluded = set(settings.get("excluded_apps", []))
+        excluded_raw = settings.get("excluded_apps", [])
+        if not isinstance(excluded_raw, list):
+            logger.warning("excluded_apps is not a list; resetting")
+            excluded = set()
+        else:
+            excluded = {app.lower() for app in excluded_raw if isinstance(app, str)}
         self._redactor = WindowTitleRedactor(mode=mode, sensitive_apps=excluded)
 
     # ── Public API ────────────────────────────────────────────────────────────

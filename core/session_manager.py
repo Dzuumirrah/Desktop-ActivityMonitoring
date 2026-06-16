@@ -58,10 +58,14 @@ def _get_active_window_windows() -> Optional[WindowInfo]:
         title    = buf.value.strip()
 
         # Process ID
-        pid      = ctypes.c_ulong()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        pid_val  = pid.value
-
+        pid_val = ctypes.wintypes.DWORD()
+        tid = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_val))
+        if not tid or pid_val.value == 0:
+            logger.warning(f"GetWindowThreadProcessId failed for hwnd={hwnd}")
+            return None  # or stub with "unknown.exe"
+            
+        pid_val = pid_val.value  # Extract the actual value
+        
         try:
             proc = psutil.Process(pid_val)
             return WindowInfo(
@@ -207,11 +211,16 @@ class SessionManager:
 
         # 1. Different window handle (most reliable)
         if old.hwnd != 0 and new.hwnd != 0 and old.hwnd != new.hwnd:
+            logger.debug(f"Session closed: HWND changed ({old.hwnd} → {new.hwnd})")
             return True
 
         # 2. Same process, title changed
         if (old.process_id == new.process_id
                 and old.window_title != new.window_title):
+            logger.debug(
+                f"Session closed: Title changed in {old.process_name} "
+                f"({old.window_title[:30]!r} → {new.window_title[:30]!r})"
+            )
             return True
 
         # 3. Process restarted
@@ -219,6 +228,10 @@ class SessionManager:
                 and old.create_time != 0.0
                 and new.create_time != 0.0
                 and abs(old.create_time - new.create_time) > 1.0):
+            logger.debug(
+                f"Session closed: Process restarted ({old.process_name}, "
+                f"create_time {old.create_time} → {new.create_time})"
+            )
             return True
 
         return False

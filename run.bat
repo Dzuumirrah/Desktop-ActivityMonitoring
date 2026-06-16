@@ -4,6 +4,7 @@ REM Run once to install dependencies, then again to start the app.
 
 setlocal
 set "SCRIPT_DIR=%~dp0"
+set PYTHONUNBUFFERED=1
 cd /d "%SCRIPT_DIR%"
 
 echo ================================================

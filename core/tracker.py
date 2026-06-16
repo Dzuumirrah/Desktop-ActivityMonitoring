@@ -46,6 +46,7 @@ class ActivityTracker:
         self._paused          = False
         self._idle_active     = False
         self._last_health_ping = 0.0
+        self._last_settings_check = time.time()
 
         # Callbacks (set by GUI or sync engine)
         self.on_session_saved: Optional[Callable[[dict], None]] = None
@@ -110,6 +111,13 @@ class ActivityTracker:
 
     def _tick(self) -> None:
         now = time.monotonic()
+        # ── Check if settings changed ─────────────────────────────────────────
+        if now - self._last_settings_check > 10:
+            new_idle = settings.get("idle_timeout", 300)
+            if new_idle != self._idle_detector._threshold:
+                self._idle_detector.update_threshold(new_idle)
+                logger.info(f"Idle threshold updated to {new_idle}s")
+            self._last_settings_check = now
 
         # ── Health ping ───────────────────────────────────────────────────────
         if now - self._last_health_ping >= self.HEALTH_PING_INTERVAL:

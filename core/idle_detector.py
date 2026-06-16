@@ -24,7 +24,6 @@ _IS_WINDOWS = sys.platform == "win32"
 
 
 def _get_windows_idle_ms() -> int:
-    """Return milliseconds since last user input using Win32 API."""
     try:
         import ctypes
         class LASTINPUTINFO(ctypes.Structure):
@@ -32,10 +31,15 @@ def _get_windows_idle_ms() -> int:
 
         lii = LASTINPUTINFO()
         lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
-        ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii))
+        result = ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii))
+        if not result:
+            logger.debug("GetLastInputInfo returned False (not initialized?)")
+            return 0
+            
         elapsed = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
         return elapsed
-    except Exception:
+    except Exception as e:
+        logger.warning(f"GetLastInputInfo failed: {e}; returning 0")
         return 0
 
 
@@ -43,19 +47,34 @@ def _is_screen_locked() -> bool:
     """Return True if the Windows workstation is locked."""
     if not _IS_WINDOWS:
         return False
+
     try:
         import ctypes
+
         user32 = ctypes.windll.user32
-        # OpenInputDesktop returns NULL when screen is locked
-        hdesk = user32.OpenInputDesktop(0, False, 0x0200)
+        kernel32 = ctypes.windll.kernel32
+
+        hdesk = user32.OpenInputDesktop(
+            0,
+            False,
+            0x0100  # DESKTOP_SWITCHDESKTOP
+        )
+
         if hdesk:
             user32.CloseDesktop(hdesk)
             return False
+
+        err = kernel32.GetLastError()
+
+        # Access denied does not imply lock
+        if err == 5:
+            return False
+
         return True
+
     except Exception:
         return False
-
-
+    
 class IdleDetector:
     """
     Thread-safe idle detector.
