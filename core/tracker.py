@@ -30,12 +30,13 @@ class ActivityTracker:
     """
     Run in a background thread via .start() / .stop().
 
-    Emits callbacks:
+    Callbacks (set before calling start()):
       on_session_saved(activity_dict)
       on_idle_changed(is_idle, reason)
     """
 
     HEALTH_PING_INTERVAL = 60   # seconds
+    _MIN_SESSION_SEC     = 5    # discard sessions shorter than this
 
     def __init__(self) -> None:
         self._db              = get_db()
@@ -48,7 +49,12 @@ class ActivityTracker:
         self._last_health_ping = 0.0
         self._last_settings_check = time.time()
 
-        # Callbacks (set by GUI or sync engine)
+        # Session continuation state (Issue 2 fix)
+        self._last_closed_window: Optional[WindowInfo] = None
+        self._last_closed_end:    Optional[datetime]   = None
+        self._just_resumed:       bool                 = False
+
+        # GUI callbacks
         self.on_session_saved: Optional[Callable[[dict], None]] = None
         self.on_idle_changed:  Optional[Callable[[bool, Optional[str]], None]] = None
 
@@ -111,7 +117,8 @@ class ActivityTracker:
 
     def _tick(self) -> None:
         now = time.monotonic()
-        # ── Check if settings changed ─────────────────────────────────────────
+
+        # ── Live settings reload ──────────────────────────────────────────────
         if now - self._last_settings_check > 10:
             new_idle = settings.get("idle_timeout", 300)
             if new_idle != self._idle_detector._threshold:
@@ -126,6 +133,7 @@ class ActivityTracker:
 
         # ── Idle detection ────────────────────────────────────────────────────
         is_idle, reason = self._idle_detector.is_idle()
+
         if is_idle != self._idle_active:
             self._idle_active = is_idle
             logger.info(f"Idle state → {'IDLE' if is_idle else 'ACTIVE'} ({reason})")
@@ -133,14 +141,28 @@ class ActivityTracker:
                 self.on_idle_changed(is_idle, reason)
 
             if is_idle:
-                # Close open session when going idle
+                # ── Going idle ────────────────────────────────────────────────
+                # Close the current session and mark it as ACTIVE (not idle).
+                # The session was real work; it just ended because the user
+                # stopped providing input.  Marking it is_idle=True would hide
+                # it from all dashboard statistics — that was the original bug.
                 closed = self._session_mgr.force_close()
                 if closed:
+                    end_now = datetime.now()
                     self._persist_session(
-                        closed.window, closed.start_time, datetime.now(),
-                        is_idle=True, idle_reason=reason
+                        closed.window, closed.start_time, end_now,
+                        is_idle=False,      # FIX: session was active
+                        idle_reason=None,   # FIX: idle_reason belongs on idle gaps, not work
                     )
-                return  # Don't start new session while idle
+                    # Remember for possible continuation after idle resumes
+                    self._last_closed_window = closed.window
+                    self._last_closed_end    = end_now
+                return  # Don't poll while transitioning to idle
+
+            else:
+                # ── Returning from idle ────────────────────────────────────────
+                # Flag so the next window poll can attempt session continuation.
+                self._just_resumed = True
 
         if is_idle:
             return  # Stay paused while idle
@@ -148,13 +170,35 @@ class ActivityTracker:
         # ── Window sampling ───────────────────────────────────────────────────
         win_info: Optional[WindowInfo] = get_active_window()
         if not win_info:
+            self._just_resumed = False
             return
 
         # Privacy gate
         if not privacy_manager.should_track(win_info.process_name):
+            self._just_resumed = False
             return
 
         closed, new_started = self._session_mgr.update(win_info)
+
+        # ── Session continuation after idle ───────────────────────────────────
+        # If the user comes back to the exact same window they were in before
+        # idle (same process + same title), resume from where the last session
+        # ended rather than starting a new session from "now".  This avoids
+        # chopping a single long activity into many 300-s stubs.
+        if self._just_resumed:
+            self._just_resumed = False
+            if (new_started
+                    and self._last_closed_window is not None
+                    and self._last_closed_end    is not None
+                    and win_info.process_name == self._last_closed_window.process_name
+                    and win_info.window_title == self._last_closed_window.window_title):
+                self._session_mgr.resume_from(self._last_closed_end)
+                self._last_closed_window = None
+                logger.info(
+                    f"Session continued: [{win_info.process_name}] "
+                    f"{win_info.window_title[:50]!r}"
+                )
+
         if closed:
             self._persist_session(closed.window, closed.start_time, datetime.now())
 
@@ -162,14 +206,24 @@ class ActivityTracker:
 
     def _persist_session(
         self,
-        window: WindowInfo,
-        start_time: datetime,
-        end_time:   datetime,
-        is_idle:    bool = False,
+        window:      WindowInfo,
+        start_time:  datetime,
+        end_time:    datetime,
+        is_idle:     bool = False,
         idle_reason: Optional[str] = None,
     ) -> None:
-        if (end_time - start_time).total_seconds() < 1:
-            return  # Skip sub-second flickers
+        duration = (end_time - start_time).total_seconds()
+
+        # Filter out noisy micro-sessions (quick desktop switches, search bar
+        # flashes, tray-overflow popups, etc.).  5 s is the sweet spot:
+        # short enough to capture intentional brief app use, long enough to
+        # discard window-management artefacts.
+        if duration < self._MIN_SESSION_SEC:
+            logger.debug(
+                f"Skipping short session ({duration:.1f}s < {self._MIN_SESSION_SEC}s): "
+                f"[{window.process_name}] {window.window_title[:40]!r}"
+            )
+            return
 
         safe_title = privacy_manager.safe_title(window.process_name, window.window_title)
 
@@ -201,20 +255,18 @@ class ActivityTracker:
 
         saved = self._db.insert_activity(data)
         if saved:
-            duration = int((end_time - start_time).total_seconds())
             logger.info(
                 f"Saved: [{window.process_name}] {safe_title[:60]!r} "
-                f"({duration}s)"
+                f"({int(duration)}s)"
             )
             if self.on_session_saved:
-                self.on_session_saved({**data, "duration_seconds": duration})
+                self.on_session_saved({**data, "duration_seconds": int(duration)})
 
     # ── Device identity ───────────────────────────────────────────────────────
 
     def _get_or_create_device_id(self) -> str:
-        # Try Windows hardware UUID first
-        import sys
-        if sys.platform == "win32":
+        import sys as _sys
+        if _sys.platform == "win32":
             try:
                 import subprocess
                 result = subprocess.run(
@@ -227,16 +279,13 @@ class ActivityTracker:
             except Exception:
                 pass
 
-        # Fallback: read/generate persistent UUID
-        import os
-        id_file_path = None
         try:
             from config.settings import DATA_DIR
-            id_file_path = DATA_DIR / ".device_id"
-            if id_file_path.exists():
-                return id_file_path.read_text().strip()
+            id_path = DATA_DIR / ".device_id"
+            if id_path.exists():
+                return id_path.read_text().strip()
             new_id = str(uuid.uuid4())
-            id_file_path.write_text(new_id)
+            id_path.write_text(new_id)
             return new_id
         except Exception:
             return str(uuid.uuid4())

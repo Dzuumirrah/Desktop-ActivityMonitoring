@@ -1,11 +1,12 @@
 """
 Session boundary detection.
-Implements Phase 1 Priority 2 and Section 1.2 from Project Analysis.
 
 A session closes when ANY of the following changes:
-  - window handle (HWND) differs
-  - process restarted (different creation_time)
-  - window title changes within the same process (new task)
+  - window handle (HWND)
+  - process restarted (create_time differs by >1 s)
+  - window title changes within the same process
+
+Added: resume_from(start_time) for idle continuation support.
 """
 
 import sys
@@ -38,7 +39,7 @@ class WindowInfo:
         return (self.hwnd, self.process_name.lower(), self.window_title)
 
 
-# ── Platform implementations ──────────────────────────────────────────────────
+# ── Platform window readers ───────────────────────────────────────────────────
 
 def _get_active_window_windows() -> Optional[WindowInfo]:
     try:
@@ -46,33 +47,31 @@ def _get_active_window_windows() -> Optional[WindowInfo]:
         import ctypes.wintypes as wt
         import psutil
 
-        user32   = ctypes.windll.user32
-        hwnd     = user32.GetForegroundWindow()
+        user32 = ctypes.windll.user32
+        hwnd   = user32.GetForegroundWindow()
         if not hwnd:
             return None
 
         # Window title
-        length   = user32.GetWindowTextLengthW(hwnd) + 1
-        buf      = ctypes.create_unicode_buffer(length)
-        user32.GetWindowTextW(hwnd, buf, length)
-        title    = buf.value.strip()
+        length = user32.GetWindowTextLengthW(hwnd) + 1
+        buf    = ctypes.create_unicode_buffer(max(length, 2))
+        user32.GetWindowTextW(hwnd, buf, max(length, 2))
+        title  = buf.value.strip()
 
-        # Process ID
-        pid_val = ctypes.wintypes.DWORD()
-        tid = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_val))
-        if not tid or pid_val.value == 0:
-            logger.warning(f"GetWindowThreadProcessId failed for hwnd={hwnd}")
-            return None  # or stub with "unknown.exe"
-            
-        pid_val = pid_val.value  # Extract the actual value
-        
+        # Process ID — use DWORD output param, not return value
+        pid = wt.DWORD()
+        tid = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not tid or pid.value == 0:
+            logger.debug(f"GetWindowThreadProcessId failed for hwnd={hwnd}")
+            return None
+
         try:
-            proc = psutil.Process(pid_val)
+            proc = psutil.Process(pid.value)
             return WindowInfo(
                 hwnd            = hwnd,
                 window_title    = title,
                 process_name    = proc.name(),
-                process_id      = pid_val,
+                process_id      = pid.value,
                 executable_path = proc.exe(),
                 create_time     = proc.create_time(),
             )
@@ -81,7 +80,7 @@ def _get_active_window_windows() -> Optional[WindowInfo]:
                 hwnd            = hwnd,
                 window_title    = title,
                 process_name    = "unknown.exe",
-                process_id      = pid_val,
+                process_id      = pid.value,
                 executable_path = "",
                 create_time     = 0.0,
             )
@@ -93,7 +92,8 @@ def _get_active_window_windows() -> Optional[WindowInfo]:
 def _get_active_window_linux() -> Optional[WindowInfo]:
     """Fallback for Linux / CI environments using xdotool."""
     try:
-        import subprocess, psutil
+        import subprocess
+        import psutil
         result = subprocess.run(
             ["xdotool", "getactivewindow", "getwindowname"],
             capture_output=True, text=True, timeout=2
@@ -104,7 +104,7 @@ def _get_active_window_linux() -> Optional[WindowInfo]:
             ["xdotool", "getactivewindow", "getwindowpid"],
             capture_output=True, text=True, timeout=2
         )
-        pid = int(pid_result.stdout.strip() or "0")
+        pid       = int(pid_result.stdout.strip() or "0")
         proc_name = "unknown"
         exe_path  = ""
         create_t  = 0.0
@@ -148,16 +148,11 @@ class SessionManager:
     """
     Tracks the current focus session and decides when to close it.
 
-    Rules (in priority order):
-      1. Different HWND → new session
-      2. Same process, title changed → new session
-      3. Process restarted (create_time differs by >1 s) → new session
-      4. Rapid switch (<2 s) and same process → treat as continuation
+    Rules (priority order):
+      1. Different HWND              → new session
+      2. Same PID, title changed     → new session
+      3. Process restarted           → new session
     """
-
-    # If window changes back within this many seconds and same process,
-    # treat it as an interruption rather than a new session.
-    CONTINUITY_THRESHOLD_SEC = 2.0
 
     def __init__(self) -> None:
         self._current: Optional[ActiveSession] = None
@@ -185,9 +180,9 @@ class SessionManager:
             return None, True
 
         if self._should_close(new_info):
-            closed           = self._current
+            closed                 = self._current
             self._last_switch_time = time.monotonic()
-            self._current    = ActiveSession(window=new_info)
+            self._current          = ActiveSession(window=new_info)
             logger.debug(
                 f"Session closed: [{closed.window.process_name}] "
                 f"{closed.window.window_title[:60]!r}"
@@ -204,17 +199,28 @@ class SessionManager:
             return closed
         return None
 
-    # ── Decision logic ────────────────────────────────────────────────────────
+    def resume_from(self, start_time: datetime) -> None:
+        """
+        Adjust the current session's start_time for idle continuation.
+
+        Called by ActivityTracker when the user returns to the same window
+        that was active before going idle.  By back-dating the start to the
+        end of the previous session, we stitch the two halves together into
+        one continuous activity without including the idle gap.
+        """
+        if self._current is not None:
+            self._current.start_time = start_time
+            logger.debug(f"Session start adjusted to {start_time} for continuation.")
 
     def _should_close(self, new: WindowInfo) -> bool:
         old = self._current.window  # type: ignore[union-attr]
 
-        # 1. Different window handle (most reliable)
+        # 1. Different HWND
         if old.hwnd != 0 and new.hwnd != 0 and old.hwnd != new.hwnd:
             logger.debug(f"Session closed: HWND changed ({old.hwnd} → {new.hwnd})")
             return True
 
-        # 2. Same process, title changed
+        # 2. Title changed within same process
         if (old.process_id == new.process_id
                 and old.window_title != new.window_title):
             logger.debug(

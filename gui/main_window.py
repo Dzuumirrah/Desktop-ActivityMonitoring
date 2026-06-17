@@ -44,9 +44,7 @@ QLineEdit, QComboBox, QSpinBox, QDateEdit {
     border: 1px solid #45475a; border-radius: 6px;
     padding: 4px 8px; font-size: 12px;
 }
-QLineEdit:focus, QComboBox:focus {
-    border-color: #4f8ef7;
-}
+QLineEdit:focus, QComboBox:focus { border-color: #4f8ef7; }
 QComboBox::drop-down { border: none; width: 20px; }
 QComboBox QAbstractItemView {
     background: #313244; color: #cdd6f4;
@@ -58,7 +56,7 @@ QPushButton {
     border: 1px solid #45475a; border-radius: 6px;
     padding: 5px 14px; font-size: 12px;
 }
-QPushButton:hover  { background: #45475a; }
+QPushButton:hover   { background: #45475a; }
 QPushButton:pressed { background: #585b70; }
 QCheckBox { color: #cdd6f4; }
 QCheckBox::indicator {
@@ -85,7 +83,6 @@ QMenu::item:selected { background: #45475a; }
 
 
 # ── Tray icon ─────────────────────────────────────────────────────────────────
-
 def _make_tray_icon() -> QIcon:
     """Create a simple 32×32 "AM" icon for the system tray."""
     pm = QPixmap(32, 32)
@@ -100,7 +97,6 @@ def _make_tray_icon() -> QIcon:
 
 
 # ── Sidebar button ────────────────────────────────────────────────────────────
-
 class NavButton(QPushButton):
     def __init__(self, icon_text: str, label: str, parent=None) -> None:
         super().__init__(parent)
@@ -108,8 +104,6 @@ class NavButton(QPushButton):
         self._label     = label
         self.setCheckable(True)
         self.setFixedHeight(48)
-        # BUG FIX: must call setText() so Qt actually renders the label.
-        # Overriding text() alone has no effect on what Qt displays.
         self.setText(f"  {icon_text}  {label}")
         self._update_style(False)
 
@@ -137,10 +131,11 @@ class NavButton(QPushButton):
 class MainWindow(QMainWindow):
     def __init__(self, tracker=None, sync_engine=None) -> None:
         super().__init__()
-        self._tracker     = tracker
-        self._sync_engine = sync_engine
-        self._db          = get_db()
+        self._tracker       = tracker
+        self._sync_engine   = sync_engine
+        self._db            = get_db()
         self._quit_for_real = False
+        self._closing       = False   # re-entrancy guard
 
         self.setWindowTitle("Activity Monitor")
         self.resize(1100, 720)
@@ -151,7 +146,7 @@ class MainWindow(QMainWindow):
         self._connect_tracker()
         logger.info("Main window created.")
 
-    # ── UI construction ───────────────────────────────────────────────────────
+    # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
         root_widget = QWidget()
@@ -220,7 +215,6 @@ class MainWindow(QMainWindow):
         L.setSpacing(0)
 
         self._stack = QStackedWidget()
-
         self._page_dashboard  = DashboardPage()
         self._page_timeline   = TimelinePage()
         self._page_statistics = StatisticsPage()
@@ -262,7 +256,23 @@ class MainWindow(QMainWindow):
             self._show_window()
 
     def _quit(self) -> None:
+        """
+        Triggered from tray menu 'Quit'.
+        Explicitly hide the tray icon BEFORE calling quit() so it disappears
+        immediately, even when called from another virtual desktop.
+        """
+        if self._closing:
+            return
+        self._closing       = True
         self._quit_for_real = True
+
+        # Hide tray first — prevents the lingering icon after quit
+        try:
+            self._tray.hide()
+            self._tray.setVisible(False)
+        except Exception:
+            pass
+
         QApplication.quit()
 
     # ── Navigation ────────────────────────────────────────────────────────────
@@ -316,16 +326,28 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self._quit_for_real:
-            # Real quit triggered from tray menu
+            # Real quit (from tray menu): stop subsystems
+            if not self._closing:
+                self._closing = True
             logger.info("Window closing – stopping tracker and sync.")
             if self._tracker:
-                self._tracker.stop()
+                try:
+                    self._tracker.stop()
+                except Exception:
+                    pass
             if self._sync_engine:
-                self._sync_engine.stop()
-            self._tray.hide()
+                try:
+                    self._sync_engine.stop()
+                except Exception:
+                    pass
+            try:
+                self._tray.hide()
+                self._tray.setVisible(False)
+            except Exception:
+                pass
             event.accept()
         else:
-            # X button clicked: minimize to tray instead
+            # X button / Win+Tab / fullscreen overlay: minimize to tray instead
             event.ignore()
             self.hide()
             self._tray.showMessage(

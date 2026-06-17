@@ -35,6 +35,6 @@ pip install --quiet -r requirements.txt
 
 REM Launch
 echo [START] Launching Activity Monitor…
-python main.py
+python -X faulthandler main.py
 
 endlocal

@@ -13,6 +13,7 @@ Startup sequence:
 
 import sys
 import os
+import atexit
 
 # Ensure project root is on sys.path regardless of CWD
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -28,7 +29,7 @@ def _check_for_updates() -> None:
     from config.settings import settings
     try:
         resp = requests.get(
-            "https://api.github.com/repos/yourname/activity-monitor/releases/latest",
+            "https://api.github.com/repos/Dzuumirrah/Desktop-ActivityMonitoring/releases/latest",
             timeout=5,
         )
         latest = resp.json().get("tag_name", "v0.0.0").lstrip("v")
@@ -45,7 +46,6 @@ def _schedule_jobs(db) -> None:
         from apscheduler.schedulers.background import BackgroundScheduler
         from config.settings import settings, DB_PATH
         from utils.backup import create_backup
-        from pathlib import Path
 
         scheduler = BackgroundScheduler(daemon=True)
 
@@ -85,6 +85,7 @@ def main() -> int:
     app.setApplicationName("Activity Monitor")
     app.setApplicationVersion("1.0.0")
     app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    app.setQuitOnLastWindowClosed(False)
 
     # Apply global stylesheet
     from gui.main_window import APP_STYLESHEET
@@ -126,12 +127,38 @@ def main() -> int:
     window = MainWindow(tracker=tracker, sync_engine=sync_engine)
     window.show()
 
+        # ── Cleanup on any exit path ──────────────────────────────────────────────
+    def _on_app_quit() -> None:
+        """Called by Qt when app.exec() is about to return."""
+        logger.info("Application quitting (aboutToQuit)…")
+        # Ensure tray icon is removed even on unexpected exits
+        try:
+            window._tray.hide()
+            window._tray.setVisible(False)
+        except Exception:
+            pass
+        if scheduler:
+            try:
+                scheduler.shutdown(wait=False)
+            except Exception:
+                pass
+
+    app.aboutToQuit.connect(_on_app_quit)
+
+    # atexit safety net for process-level crashes
+    def _atexit_cleanup() -> None:
+        try:
+            import ctypes
+            # Nothing reliable we can do for the tray here;
+            # aboutToQuit covers normal exits.
+        except Exception:
+            pass
+
+    atexit.register(_atexit_cleanup)
+
     logger.info("Application launched successfully.")
     ret = app.exec()
 
-    # ── Cleanup ───────────────────────────────────────────────────────────────
-    if scheduler:
-        scheduler.shutdown(wait=False)
     logger.info("Application exiting.")
     return ret
 
