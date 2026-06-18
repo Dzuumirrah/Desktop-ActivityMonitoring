@@ -35,6 +35,6 @@ pip install --quiet -r requirements.txt
 
 REM Launch
 echo [START] Launching Activity Monitor…
-python -X faulthandler main.py
-
+@REM python -X faulthandler main.py
+start "" .venv\Scripts\pythonw.exe main.py
 endlocal
