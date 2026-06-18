@@ -47,6 +47,13 @@ def _label(text: str) -> QLabel:
     return lbl
 
 
+def _status_label() -> QLabel:
+    """Inline status / toast label used at the bottom of each group."""
+    lbl = QLabel("")
+    lbl.setStyleSheet("color: #a6e3a1; font-size: 11px; padding-top: 2px;")
+    return lbl
+
+
 class _Signals(QObject):
     settings_changed = Signal()
 
@@ -100,34 +107,35 @@ class SettingsPage(QWidget):
         form = QFormLayout(g)
         form.setSpacing(10)
 
-        # Polling interval
         self._polling_combo = QComboBox()
         for v in VALID_POLLING_INTERVALS:
-            self._polling_combo.addItem(f"{v} second{'s' if v>1 else ''}", v)
-        self._polling_combo.setCurrentIndex(
-            VALID_POLLING_INTERVALS.index(settings.get("polling_interval", 1))
-        )
+            self._polling_combo.addItem(f"{v} second{'s' if v > 1 else ''}", v)
+        cur_poll = settings.get("polling_interval", 1)
+        idx = VALID_POLLING_INTERVALS.index(cur_poll) if cur_poll in VALID_POLLING_INTERVALS else 0
+        self._polling_combo.setCurrentIndex(idx)
         form.addRow(_label("Polling interval"), self._polling_combo)
 
-        # Idle timeout
         self._idle_combo = QComboBox()
         for v in VALID_IDLE_TIMEOUTS:
-            self._idle_combo.addItem(f"{v//60} min" if v >= 60 else f"{v}s", v)
+            self._idle_combo.addItem(f"{v // 60} min" if v >= 60 else f"{v}s", v)
         cur_idle = settings.get("idle_timeout", 300)
         idx = VALID_IDLE_TIMEOUTS.index(cur_idle) if cur_idle in VALID_IDLE_TIMEOUTS else 2
         self._idle_combo.setCurrentIndex(idx)
         form.addRow(_label("Idle timeout"), self._idle_combo)
 
-        # Device name
         self._device_name_edit = QLineEdit(settings.get("device_name", ""))
         self._device_name_edit.setPlaceholderText("Leave blank to use hostname")
         form.addRow(_label("Device name"), self._device_name_edit)
 
-        # Save button
         save_btn = QPushButton("Save Tracker Settings")
         save_btn.clicked.connect(self._save_tracker)
-        form.addRow("", save_btn)
         self._style_button(save_btn)
+        form.addRow("", save_btn)
+
+        # ── Inline status label for this group ────────────────────────────────
+        self._tracker_status_lbl = _status_label()
+        form.addRow("", self._tracker_status_lbl)
+
         return g
 
     # ── Privacy group ─────────────────────────────────────────────────────────
@@ -137,7 +145,6 @@ class SettingsPage(QWidget):
         L = QVBoxLayout(g)
         L.setSpacing(10)
 
-        # Mode selector
         mode_row = QHBoxLayout()
         mode_row.addWidget(_label("Privacy mode:"))
         self._privacy_combo = QComboBox()
@@ -152,7 +159,6 @@ class SettingsPage(QWidget):
         mode_row.addWidget(self._privacy_combo)
         L.addLayout(mode_row)
 
-        # Excluded apps list
         L.addWidget(_label("Excluded apps (window title fully redacted):"))
         self._excluded_list = QListWidget()
         self._excluded_list.setMaximumHeight(100)
@@ -176,6 +182,11 @@ class SettingsPage(QWidget):
         self._style_button(add_btn)
         self._style_button(rem_btn, danger=True)
         L.addLayout(row)
+
+        # ── Inline status label for this group ────────────────────────────────
+        self._privacy_status_lbl = _status_label()
+        L.addWidget(self._privacy_status_lbl)
+
         return g
 
     # ── Sync group ────────────────────────────────────────────────────────────
@@ -203,7 +214,7 @@ class SettingsPage(QWidget):
         form.addRow(_label("Sync interval"), self._sync_interval_combo)
 
         btn_row = QHBoxLayout()
-        auth_btn = QPushButton("Authenticate Google")
+        auth_btn     = QPushButton("Authenticate Google")
         auth_btn.clicked.connect(self._authenticate_google)
         sync_now_btn = QPushButton("Sync Now")
         sync_now_btn.clicked.connect(self._sync_now)
@@ -214,9 +225,11 @@ class SettingsPage(QWidget):
             btn_row.addWidget(b)
         form.addRow("", btn_row)
 
-        self._sync_status_lbl = QLabel("Not authenticated")
+        self._sync_status_lbl = _status_label()
+        self._sync_status_lbl.setText("Not authenticated")
         self._sync_status_lbl.setStyleSheet("color: #f38ba8; font-size: 11px;")
         form.addRow("", self._sync_status_lbl)
+
         return g
 
     # ── Data management group ─────────────────────────────────────────────────
@@ -226,7 +239,6 @@ class SettingsPage(QWidget):
         L = QVBoxLayout(g)
         L.setSpacing(10)
 
-        # Retention
         ret_row = QHBoxLayout()
         ret_row.addWidget(_label("Keep active records for:"))
         self._retention_combo = QComboBox()
@@ -240,30 +252,28 @@ class SettingsPage(QWidget):
         ret_row.addWidget(self._retention_combo)
         L.addLayout(ret_row)
 
-        # Auto backup toggle
         self._auto_backup_cb = QCheckBox("Auto-backup database daily")
         self._auto_backup_cb.setChecked(settings.get("auto_backup", True))
         self._auto_backup_cb.setStyleSheet("color: #cdd6f4;")
         L.addWidget(self._auto_backup_cb)
 
-        # Buttons
         btn_row = QHBoxLayout()
-        backup_now_btn = QPushButton("Backup Now")
-        backup_now_btn.clicked.connect(self._backup_now)
-        archive_btn = QPushButton("Archive Old Data")
-        archive_btn.clicked.connect(self._archive_data)
-        restore_btn = QPushButton("Restore Backup…")
-        restore_btn.clicked.connect(self._restore_backup)
-        save_data_btn = QPushButton("Save Data Settings")
-        save_data_btn.clicked.connect(self._save_data_settings)
-        for b in (backup_now_btn, archive_btn, restore_btn, save_data_btn):
+        for label, slot in [
+            ("Backup Now",       self._backup_now),
+            ("Archive Old Data", self._archive_data),
+            ("Restore Backup…",  self._restore_backup),
+            ("Save Data Settings", self._save_data_settings),
+        ]:
+            b = QPushButton(label)
+            b.clicked.connect(slot)
             self._style_button(b)
             btn_row.addWidget(b)
         L.addLayout(btn_row)
 
-        self._data_status_lbl = QLabel("")
+        self._data_status_lbl = _status_label()
         self._data_status_lbl.setStyleSheet("color: #a6e3a1; font-size: 11px;")
         L.addWidget(self._data_status_lbl)
+
         return g
 
     # ── Health group ──────────────────────────────────────────────────────────
@@ -303,21 +313,32 @@ class SettingsPage(QWidget):
             "idle_timeout":     self._idle_combo.currentData(),
             "device_name":      self._device_name_edit.text().strip(),
         })
-        self._show_toast(self._data_status_lbl, "Tracker settings saved.")
+        # Show confirmation in the TRACKER group (fix: was posting to data group)
+        self._show_toast(self._tracker_status_lbl, "✓ Tracker settings saved.")
         self.settings_changed.emit()
+        logger.info(
+            f"Tracker settings saved: polling={self._polling_combo.currentData()}s, "
+            f"idle={self._idle_combo.currentData()}s"
+        )
 
     def _on_privacy_mode_changed(self) -> None:
         mode = self._privacy_combo.currentData()
         privacy_manager.mode = mode
+        # Immediate visual feedback — mode is already live
+        self._show_toast(
+            self._privacy_status_lbl,
+            f"✓ Privacy mode set to '{mode}' (live).",
+        )
         logger.info(f"Privacy mode changed to: {mode}")
 
     def _add_excluded_app(self) -> None:
-        app = self._new_app_edit.text().strip()
+        app = self._new_app_edit.text().strip().lower()
         if not app:
             return
         privacy_manager.add_excluded_app(app)
-        self._excluded_list.addItem(app.lower())
+        self._excluded_list.addItem(app)
         self._new_app_edit.clear()
+        self._show_toast(self._privacy_status_lbl, f"✓ '{app}' excluded (live).")
 
     def _remove_excluded_app(self) -> None:
         row = self._excluded_list.currentRow()
@@ -326,29 +347,37 @@ class SettingsPage(QWidget):
         app = self._excluded_list.item(row).text()
         privacy_manager.remove_excluded_app(app)
         self._excluded_list.takeItem(row)
+        self._show_toast(self._privacy_status_lbl, f"✓ '{app}' removed (live).")
 
     def _authenticate_google(self) -> None:
         if not self._sync_engine:
             self._sync_status_lbl.setText("Sync engine not available.")
             return
         self._sync_status_lbl.setText("Opening browser for authentication…")
+        self._sync_status_lbl.setStyleSheet("color: #f9e2af; font-size: 11px;")
+
         def _auth():
-            ok = self._sync_engine.authenticate()
+            ok  = self._sync_engine.authenticate()
             txt = "✓ Authenticated" if ok else f"✗ {self._sync_engine.last_error}"
-            color = "#a6e3a1" if ok else "#f38ba8"
+            clr = "#a6e3a1" if ok else "#f38ba8"
             self._sync_status_lbl.setText(txt)
-            self._sync_status_lbl.setStyleSheet(f"color: {color}; font-size: 11px;")
+            self._sync_status_lbl.setStyleSheet(f"color: {clr}; font-size: 11px;")
+
         threading.Thread(target=_auth, daemon=True).start()
 
     def _sync_now(self) -> None:
         if not self._sync_engine:
             return
         self._sync_status_lbl.setText("Syncing…")
+        self._sync_status_lbl.setStyleSheet("color: #f9e2af; font-size: 11px;")
+
         def _do():
             ok = self._sync_engine.sync_now()
-            self._sync_status_lbl.setText(
-                "✓ Sync complete" if ok else "✗ Sync failed"
-            )
+            txt = "✓ Sync complete" if ok else "✗ Sync failed"
+            clr = "#a6e3a1" if ok else "#f38ba8"
+            self._sync_status_lbl.setText(txt)
+            self._sync_status_lbl.setStyleSheet(f"color: {clr}; font-size: 11px;")
+
         threading.Thread(target=_do, daemon=True).start()
 
     def _save_sync(self) -> None:
@@ -357,25 +386,29 @@ class SettingsPage(QWidget):
             "sheet_name":     self._sheet_name_edit.text().strip() or "ActivityLog",
             "sync_interval":  self._sync_interval_combo.currentData(),
         })
-        self._show_toast(self._sync_status_lbl, "Sync settings saved.")
+        self._show_toast(self._sync_status_lbl, "✓ Sync settings saved.")
+        logger.info("Sync settings saved.")
 
     def _save_data_settings(self) -> None:
         settings.update({
             "retention_days": self._retention_combo.currentData(),
             "auto_backup":    self._auto_backup_cb.isChecked(),
         })
-        self._show_toast(self._data_status_lbl, "Data settings saved.")
+        self._show_toast(self._data_status_lbl, "✓ Data settings saved.")
 
     def _backup_now(self) -> None:
         from config.settings import DB_PATH
         dest = create_backup(DB_PATH)
-        msg = f"Backup created: {Path(dest).name}" if dest else "Backup failed."
+        msg  = f"✓ Backup: {Path(dest).name}" if dest else "✗ Backup failed."
         self._show_toast(self._data_status_lbl, msg)
 
     def _archive_data(self) -> None:
         days = settings.get("retention_days", 90)
-        n = self._db.archive_old_data(days)
-        self._show_toast(self._data_status_lbl, f"Archived {n} records older than {days} days.")
+        n    = self._db.archive_old_data(days)
+        self._show_toast(
+            self._data_status_lbl,
+            f"✓ Archived {n} records older than {days} days."
+        )
 
     def _restore_backup(self) -> None:
         from config.settings import DB_PATH
@@ -399,13 +432,16 @@ class SettingsPage(QWidget):
         )
         if reply == QMessageBox.Yes:
             restore_backup(DB_PATH, bpath)
-            self._show_toast(self._data_status_lbl, "Database restored. Restart recommended.")
+            self._show_toast(
+                self._data_status_lbl,
+                "✓ Database restored. Restart recommended."
+            )
 
     def _refresh_health(self) -> None:
-        h = self._db.get_health()
+        h   = self._db.get_health()
         ping = h.get("last_ping", "never")
         txt = (
-            f"Tracker alive:   {'Yes' if h['alive'] else 'No'}\n"
+            f"Tracker alive:   {'Yes ✓' if h['alive'] else 'No ✗'}\n"
             f"Last ping:       {ping}\n"
             f"Uptime:          {h['uptime_sec']}s\n"
             f"DB size:         {h['db_size_mb']} MB\n"
@@ -463,12 +499,12 @@ class SettingsPage(QWidget):
                 border: 1px solid {color}66; border-radius: 6px;
                 padding: 5px 12px; font-size: 11px;
             }}
-            QPushButton:hover {{ background: {color}44; }}
+            QPushButton:hover  {{ background: {color}44; }}
             QPushButton:pressed {{ background: {color}66; }}
         """)
 
     @staticmethod
-    def _show_toast(label: QLabel, text: str) -> None:
+    def _show_toast(label: QLabel, text: str, ms: int = 4000) -> None:
+        """Display text in label and auto-clear after ms milliseconds."""
         label.setText(text)
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(4000, lambda: label.setText(""))
+        QTimer.singleShot(ms, lambda: label.setText(""))

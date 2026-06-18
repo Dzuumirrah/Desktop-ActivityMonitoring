@@ -1,6 +1,8 @@
 """
 Cloud sync engine: Google Sheets with batched upload, retry, and deduplication.
-Implements Phase 1 Priority 3, Section 1.4, and Section 2.4 from Project Analysis.
+
+Issue 1 fix: sync_interval is now read inside the wait() call on every
+iteration so a change in Settings takes effect within one cycle.
 """
 
 import threading
@@ -14,11 +16,9 @@ from config.settings import settings, DATA_DIR
 from core.database import get_db
 from utils.logger import sync_log as logger
 
-# ── Token path ────────────────────────────────────────────────────────────────
-TOKEN_FILE = DATA_DIR / "google_token.json"
+TOKEN_FILE       = DATA_DIR / "google_token.json"
 CREDENTIALS_FILE = DATA_DIR / "google_credentials.json"
 
-# ── Sync configuration ────────────────────────────────────────────────────────
 BATCH_SIZE   = 50
 MAX_RETRIES  = 3
 BASE_BACKOFF = 2   # seconds
@@ -36,7 +36,7 @@ def _build_sheets_service():
         from googleapiclient.discovery import build
 
         SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = None
+        creds  = None
 
         if TOKEN_FILE.exists():
             creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
@@ -50,11 +50,10 @@ def _build_sheets_service():
                         f"Google credentials not found at {CREDENTIALS_FILE}. "
                         "Download credentials.json from Google Cloud Console."
                     )
-                flow = InstalledAppFlow.from_client_secrets_file(
+                flow  = InstalledAppFlow.from_client_secrets_file(
                     str(CREDENTIALS_FILE), SCOPES
                 )
                 creds = flow.run_local_server(port=0)
-
             TOKEN_FILE.write_text(creds.to_json())
 
         return build("sheets", "v4", credentials=creds, cache_discovery=False)
@@ -69,10 +68,11 @@ class SheetsSyncEngine:
     """
     Uploads pending activity records to a Google Sheet.
 
-    Lifecycle:
+    Lifecycle::
+
         engine = SheetsSyncEngine()
-        engine.start()   # background thread
-        engine.stop()    # clean shutdown
+        engine.start()
+        engine.stop()
     """
 
     HEADER_ROW = [
@@ -88,16 +88,15 @@ class SheetsSyncEngine:
         self._service        = None
         self._authenticated  = False
         self._last_error: Optional[str] = None
-        self._on_status: Optional[callable] = None   # GUI callback
+        self._on_status: Optional[callable] = None
 
     # ── Authentication ────────────────────────────────────────────────────────
 
     def authenticate(self) -> bool:
-        """Trigger OAuth flow (must be called from main thread on first run)."""
         try:
             self._service       = _build_sheets_service()
             self._authenticated = True
-            logger.info("Google Sheets authenticated successfully.")
+            logger.info("Google Sheets authenticated.")
             return True
         except Exception as exc:
             self._last_error    = str(exc)
@@ -137,7 +136,10 @@ class SheetsSyncEngine:
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def _loop(self) -> None:
-        interval_sec = settings.get("sync_interval", 15) * 60
+        """
+        sync_interval is read on every wait() call so a change in the
+        Settings page applies on the next cycle without a restart.
+        """
         while not self._stop_event.is_set():
             if self._authenticated:
                 try:
@@ -145,6 +147,8 @@ class SheetsSyncEngine:
                 except Exception as exc:
                     logger.error(f"Sync cycle error: {exc}", exc_info=True)
                     self._last_error = str(exc)
+            # ── Live settings read (Issue 1 fix) ──────────────────────────────
+            interval_sec = settings.get("sync_interval", 15) * 60
             self._stop_event.wait(timeout=interval_sec)
 
     def _sync_cycle(self) -> None:
@@ -191,7 +195,7 @@ class SheetsSyncEngine:
         existing = self._get_remote_ids(spreadsheet_id, sheet_name)
         to_upload = [r for r in records if r["activity_id"] not in existing]
         if not to_upload:
-            logger.info("All records already synced (deduplication).")
+            logger.info("All records already synced.")
             return True
 
         rows = [self._record_to_row(r) for r in to_upload]
@@ -210,10 +214,15 @@ class SheetsSyncEngine:
                 wait = BASE_BACKOFF ** attempt
                 self._last_error = str(exc)
                 if attempt < MAX_RETRIES - 1:
-                    logger.warning(f"Upload attempt {attempt+1} failed ({exc}); retry in {wait}s")
+                    logger.warning(
+                        f"Upload attempt {attempt+1} failed ({exc}); "
+                        f"retry in {wait}s"
+                    )
                     time.sleep(wait)
                 else:
-                    logger.error(f"Upload failed after {MAX_RETRIES} attempts: {exc}")
+                    logger.error(
+                        f"Upload failed after {MAX_RETRIES} attempts: {exc}"
+                    )
         return False
 
     def _get_remote_ids(self, spreadsheet_id: str, sheet_name: str) -> set[str]:
@@ -224,7 +233,6 @@ class SheetsSyncEngine:
                 range=f"'{sheet_name}'!A:A",
             ).execute()
             values = result.get("values", [])
-            # Skip header row
             return {row[0] for row in values[1:] if row}
         except Exception as exc:
             logger.warning(f"Could not fetch remote IDs: {exc}")
@@ -251,7 +259,7 @@ class SheetsSyncEngine:
     @staticmethod
     def _record_to_row(r: dict) -> list:
         return [
-            r.get("activity_id", ""),
+            r.get("activity_id",    ""),
             str(r.get("start_time", "")),
             str(r.get("end_time",   "")),
             r.get("duration_seconds", 0),
@@ -262,8 +270,6 @@ class SheetsSyncEngine:
             r.get("device_id",      ""),
             1 if r.get("is_idle") else 0,
         ]
-
-    # ── Manual trigger ────────────────────────────────────────────────────────
 
     def sync_now(self) -> bool:
         """Force an immediate sync cycle (called from GUI)."""

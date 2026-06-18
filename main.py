@@ -1,30 +1,28 @@
 """
 Activity Monitor – entry point.
 
-Startup sequence:
-  1. Validate/load settings
-  2. Open / integrity-check database
-  3. Optional startup backup
-  4. Start ActivityTracker (background thread)
-  5. Start SheetsSyncEngine (background thread)
-  6. Schedule maintenance jobs (archival, backup, update check)
-  7. Launch PySide6 GUI
+Changes
+-------
+Issue 1 – live settings
+  app.setQuitOnLastWindowClosed(False) prevents Qt quitting when the
+  window is hidden to tray.  (Added in previous session.)
+
+Issue 2 – sleep / hibernate
+  PowerMonitor is started after the tracker so sleep/wake events are
+  forwarded to tracker._on_sleep / tracker._on_wake.
 """
 
 import sys
 import os
 import atexit
 
-# Ensure project root is on sys.path regardless of CWD
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# ── Early logging setup ───────────────────────────────────────────────────────
 from utils.logger import setup_logger
 logger = setup_logger("main")
 
 
 def _check_for_updates() -> None:
-    """Quick Win #10 – weekly update check via GitHub releases."""
     import requests
     from config.settings import settings
     try:
@@ -32,7 +30,7 @@ def _check_for_updates() -> None:
             "https://api.github.com/repos/Dzuumirrah/Desktop-ActivityMonitoring/releases/latest",
             timeout=5,
         )
-        latest = resp.json().get("tag_name", "v0.0.0").lstrip("v")
+        latest  = resp.json().get("tag_name", "v0.0.0").lstrip("v")
         current = settings.get("version", "1.0.0")
         if latest > current:
             logger.info(f"Update available: v{current} → v{latest}")
@@ -40,8 +38,7 @@ def _check_for_updates() -> None:
         logger.debug(f"Update check failed: {exc}")
 
 
-def _schedule_jobs(db) -> None:
-    """Register APScheduler maintenance jobs."""
+def _schedule_jobs(db):
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
         from config.settings import settings, DB_PATH
@@ -49,20 +46,17 @@ def _schedule_jobs(db) -> None:
 
         scheduler = BackgroundScheduler(daemon=True)
 
-        # Daily backup at 02:00
         if settings.get("auto_backup", True):
             scheduler.add_job(
                 lambda: create_backup(DB_PATH),
                 "cron", hour=2, minute=0, id="daily_backup",
             )
 
-        # Nightly archival at 02:30
         scheduler.add_job(
             lambda: db.archive_old_data(settings.get("retention_days", 90)),
             "cron", hour=2, minute=30, id="archive_old",
         )
 
-        # Weekly update check (Sunday 06:00)
         if settings.get("check_for_updates", True):
             scheduler.add_job(
                 _check_for_updates,
@@ -70,7 +64,7 @@ def _schedule_jobs(db) -> None:
             )
 
         scheduler.start()
-        logger.info("Maintenance scheduler started (backup, archival, update-check).")
+        logger.info("Maintenance scheduler started.")
         return scheduler
     except ImportError:
         logger.warning("APScheduler not installed; maintenance jobs disabled.")
@@ -85,9 +79,10 @@ def main() -> int:
     app.setApplicationName("Activity Monitor")
     app.setApplicationVersion("1.0.0")
     app.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
+    # Prevent Qt from quitting when the window is hidden to the system tray.
     app.setQuitOnLastWindowClosed(False)
 
-    # Apply global stylesheet
     from gui.main_window import APP_STYLESHEET
     app.setStyleSheet(APP_STYLESHEET)
 
@@ -111,11 +106,19 @@ def main() -> int:
     tracker = ActivityTracker()
     tracker.start()
 
+    # ── Power monitor (sleep / hibernate / wake) ──────────────────────────────
+    # Must be started AFTER the tracker so the callbacks are valid.
+    from utils.power_monitor import PowerMonitor
+    power_monitor = PowerMonitor(
+        on_sleep=tracker._on_sleep,
+        on_wake=tracker._on_wake,
+    )
+    power_monitor.start()
+
     # ── Cloud sync engine ─────────────────────────────────────────────────────
     logger.info("Starting sync engine…")
     from sync.sheets import SheetsSyncEngine
     sync_engine = SheetsSyncEngine()
-    # Only start background sync if already authenticated
     if (DB_PATH.parent / "google_token.json").exists():
         if sync_engine.authenticate():
             sync_engine.start()
@@ -127,16 +130,15 @@ def main() -> int:
     window = MainWindow(tracker=tracker, sync_engine=sync_engine)
     window.show()
 
-        # ── Cleanup on any exit path ──────────────────────────────────────────────
+    # ── Cleanup on any exit path ──────────────────────────────────────────────
     def _on_app_quit() -> None:
-        """Called by Qt when app.exec() is about to return."""
         logger.info("Application quitting (aboutToQuit)…")
-        # Ensure tray icon is removed even on unexpected exits
         try:
             window._tray.hide()
             window._tray.setVisible(False)
         except Exception:
             pass
+        power_monitor.stop()
         if scheduler:
             try:
                 scheduler.shutdown(wait=False)
@@ -158,7 +160,6 @@ def main() -> int:
 
     logger.info("Application launched successfully.")
     ret = app.exec()
-
     logger.info("Application exiting.")
     return ret
 

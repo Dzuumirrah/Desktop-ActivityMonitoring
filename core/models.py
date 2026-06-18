@@ -1,11 +1,14 @@
 """
 Activity data model with strict input validation.
 Implements Quick Win #2 (Input Validation Layer) from Roadmap.
+
+Fix: future-time check now uses timedelta instead of the broken
+     second-arithmetic that incorrectly capped the threshold at :59.
 """
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from utils.logger import setup_logger
@@ -35,17 +38,17 @@ class ActivityRecord:
     device_id:       str
 
     # Optional enrichment
-    process_id:      Optional[int]  = None
-    executable_path: str            = ""
-    window_handle:   Optional[int]  = None
-    is_idle:         bool           = False
-    idle_reason:     Optional[str]  = None
-    activity_id:     str            = field(default="", init=False)
+    process_id:      Optional[int] = None
+    executable_path: str           = ""
+    window_handle:   Optional[int] = None
+    is_idle:         bool          = False
+    idle_reason:     Optional[str] = None
+    activity_id:     str           = field(default="", init=False)
 
     MAX_PROCESS_NAME = 255
     MAX_WINDOW_TITLE = 1000
     MAX_DEVICE_NAME  = 128
-    MAX_FUTURE_SEC   = 5        # allow 5s clock skew
+    MAX_FUTURE_SEC   = 10       # allow 10 s clock skew (generous for slow machines)
     MAX_DURATION_SEC = 86_400   # 24 h hard cap
 
     def __post_init__(self) -> None:
@@ -69,22 +72,29 @@ class ActivityRecord:
         if not self.device_name:
             self.device_name = "unknown"
 
-        # Times
-        now = datetime.now()
-        if self.start_time > (now.replace(second=0) if False else
-                              datetime(now.year, now.month, now.day,
-                                       now.hour, now.minute, now.second + self.MAX_FUTURE_SEC
-                                       if now.second + self.MAX_FUTURE_SEC < 60 else 59)):
-            raise ValueError(f"start_time {self.start_time} is in the future")
+        # ── Time validation (was broken: second-arithmetic could cap threshold) ──
+        now               = datetime.now()
+        future_threshold  = now + timedelta(seconds=self.MAX_FUTURE_SEC)
+
+        if self.start_time > future_threshold:
+            raise ValueError(
+                f"start_time {self.start_time} is more than "
+                f"{self.MAX_FUTURE_SEC}s in the future (now={now})"
+            )
 
         if self.start_time > self.end_time:
-            raise ValueError(f"start_time {self.start_time} > end_time {self.end_time}")
+            raise ValueError(
+                f"start_time {self.start_time} > end_time {self.end_time}"
+            )
 
         duration = self.duration_seconds
         if duration < 0:
             raise ValueError(f"Negative duration: {duration}s")
         if duration > self.MAX_DURATION_SEC:
-            raise ValueError(f"Duration {duration}s exceeds 24-hour cap")
+            raise ValueError(
+                f"Duration {duration}s exceeds 24-hour cap — "
+                "likely a clock-skew or sleep/wake artifact"
+            )
 
         # Executable path – strip only
         self.executable_path = (self.executable_path or "").strip()

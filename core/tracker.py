@@ -30,29 +30,35 @@ class ActivityTracker:
     """
     Run in a background thread via .start() / .stop().
 
-    Callbacks (set before calling start()):
-      on_session_saved(activity_dict)
-      on_idle_changed(is_idle, reason)
+    Public callbacks (set before .start()):
+        on_session_saved(activity_dict)
+        on_idle_changed(is_idle, reason)
     """
 
-    HEALTH_PING_INTERVAL = 60   # seconds
+    HEALTH_PING_INTERVAL = 60   # seconds between health-check DB pings
     _MIN_SESSION_SEC     = 5    # discard sessions shorter than this
 
     def __init__(self) -> None:
-        self._db              = get_db()
-        self._session_mgr     = SessionManager()
-        self._idle_detector   = IdleDetector()
+        self._db            = get_db()
+        self._session_mgr   = SessionManager()
+        self._idle_detector = IdleDetector()
+
         self._thread: Optional[threading.Thread] = None
-        self._stop_event      = threading.Event()
-        self._paused          = False
-        self._idle_active     = False
-        self._last_health_ping = 0.0
+        self._stop_event    = threading.Event()
+        self._paused        = False
+        self._idle_active   = False
+
+        self._last_health_ping    = 0.0
         self._last_settings_check = time.time()
 
-        # Session continuation state (Issue 2 fix)
+        # Session continuation after idle / wake
         self._last_closed_window: Optional[WindowInfo] = None
         self._last_closed_end:    Optional[datetime]   = None
         self._just_resumed:       bool                 = False
+
+        # Sleep / hibernate state
+        self._sleep_start:  Optional[datetime] = None
+        self._sleep_reason: Optional[str]      = None
 
         # GUI callbacks
         self.on_session_saved: Optional[Callable[[dict], None]] = None
@@ -82,12 +88,10 @@ class ActivityTracker:
         logger.info("Tracker started.")
 
     def stop(self) -> None:
-        """Cleanly flush the current session before exiting."""
         logger.info("Tracker stopping…")
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=10)
-        # Save whatever was open
         closed = self._session_mgr.force_close()
         if closed:
             self._persist_session(closed.window, closed.start_time, datetime.now())
@@ -103,27 +107,84 @@ class ActivityTracker:
         self._idle_detector.reset()
         logger.info("Tracker resumed.")
 
+    # ── Sleep / wake (called from PowerMonitor) ───────────────────────────────
+
+    def _on_sleep(self, reason: str = "sleep") -> None:
+        """
+        Called just before the system suspends.
+
+        Saves the active session with the correct end_time so sleep
+        time is never included in session duration.  Sets idle_active
+        to True so the polling loop stays quiet until _on_wake().
+        """
+        logger.info(f"System going to {reason} — saving active session.")
+        closed = self._session_mgr.force_close()
+        if closed:
+            end_now = datetime.now()
+            self._persist_session(
+                closed.window, closed.start_time, end_now,
+                is_idle=False, idle_reason=None,
+            )
+            self._last_closed_window = closed.window
+            self._last_closed_end    = end_now
+
+        self._sleep_start  = datetime.now()
+        self._sleep_reason = reason
+        # Suppress tracking while asleep
+        self._idle_active  = True
+
+    def _on_wake(self) -> None:
+        """
+        Called just after the system resumes from sleep / hibernate.
+
+        Resets idle state so tracking restarts on the next tick.
+        If the same window is foregrounded the session continues
+        seamlessly (no gap in the timeline).
+        """
+        now = datetime.now()
+        if self._sleep_start:
+            dur = int((now - self._sleep_start).total_seconds())
+            logger.info(
+                f"System woke after {dur}s of "
+                f"{self._sleep_reason or 'sleep'}."
+            )
+        self._sleep_start  = None
+        self._sleep_reason = None
+
+        self._idle_active  = False
+        self._idle_detector.reset()
+        # Attempt session continuation with the first window seen after wake
+        self._just_resumed = True
+
+        logger.info("Tracker resumed after system wake.")
+        if self.on_idle_changed:
+            self.on_idle_changed(False, None)
+
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def _run_loop(self) -> None:
-        poll_sec = settings.get("polling_interval", 1)
+        """
+        Polling loop.  poll_sec is read on every iteration so a change
+        to settings['polling_interval'] applies without a restart.
+        """
         while not self._stop_event.is_set():
             try:
                 if not self._paused:
                     self._tick()
             except Exception as exc:
                 logger.error(f"Tracker tick error: {exc}", exc_info=True)
+            # ── Live settings read (Issue 1 fix) ──────────────────────────────
+            poll_sec = settings.get("polling_interval", 1)
             self._stop_event.wait(timeout=poll_sec)
 
     def _tick(self) -> None:
         now = time.monotonic()
 
-        # ── Live settings reload ──────────────────────────────────────────────
+        # ── Live settings reload (idle_timeout) ───────────────────────────────
         if now - self._last_settings_check > 10:
             new_idle = settings.get("idle_timeout", 300)
             if new_idle != self._idle_detector._threshold:
                 self._idle_detector.update_threshold(new_idle)
-                logger.info(f"Idle threshold updated to {new_idle}s")
             self._last_settings_check = now
 
         # ── Health ping ───────────────────────────────────────────────────────
@@ -151,21 +212,19 @@ class ActivityTracker:
                     end_now = datetime.now()
                     self._persist_session(
                         closed.window, closed.start_time, end_now,
-                        is_idle=False,      # FIX: session was active
-                        idle_reason=None,   # FIX: idle_reason belongs on idle gaps, not work
+                        is_idle=False,   # session was real work
+                        idle_reason=None,
                     )
-                    # Remember for possible continuation after idle resumes
                     self._last_closed_window = closed.window
                     self._last_closed_end    = end_now
-                return  # Don't poll while transitioning to idle
+                return
 
             else:
-                # ── Returning from idle ────────────────────────────────────────
-                # Flag so the next window poll can attempt session continuation.
+                # Flag for session continuation check on the next window poll
                 self._just_resumed = True
 
         if is_idle:
-            return  # Stay paused while idle
+            return
 
         # ── Window sampling ───────────────────────────────────────────────────
         win_info: Optional[WindowInfo] = get_active_window()
@@ -173,7 +232,6 @@ class ActivityTracker:
             self._just_resumed = False
             return
 
-        # Privacy gate
         if not privacy_manager.should_track(win_info.process_name):
             self._just_resumed = False
             return
@@ -271,10 +329,11 @@ class ActivityTracker:
                 import subprocess
                 result = subprocess.run(
                     ["wmic", "csproduct", "get", "UUID"],
-                    capture_output=True, text=True, timeout=5
+                    capture_output=True, text=True, timeout=5,
                 )
                 lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-                if len(lines) >= 2 and lines[1] != "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF":
+                if (len(lines) >= 2
+                        and lines[1] != "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF"):
                     return lines[1]
             except Exception:
                 pass
