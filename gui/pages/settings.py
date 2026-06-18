@@ -1,10 +1,10 @@
 """
 Settings page: tracker config, privacy controls, sync setup, data management.
+SIMPLIFIED CONSOLE SOLUTION - Just open log file with notepad
 """
 
 import subprocess
 import threading
-import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -59,12 +59,9 @@ class SettingsPage(QWidget):
         self._signals     = _Signals()
         self.settings_changed = self._signals.settings_changed
 
-        # Console process tracking
+        # Console/editor process tracking
         self._console_proc: subprocess.Popen | None = None
         self._console_lock = threading.Lock()
-        self._process_check_timer = QTimer(self)
-        self._process_check_timer.timeout.connect(self._check_console_process)
-        self._temp_batch_file: Path | None = None
 
         self._build_ui()
 
@@ -282,8 +279,8 @@ class SettingsPage(QWidget):
         self._style_button(refresh_btn)
         btn_row.addWidget(refresh_btn)
 
-        self._console_btn = QPushButton("🖥  Show Console")
-        self._console_btn.clicked.connect(self._toggle_console)
+        self._console_btn = QPushButton("📄 View Log File")
+        self._console_btn.clicked.connect(self._open_log_file)
         self._style_button(self._console_btn)
         btn_row.addWidget(self._console_btn)
 
@@ -417,156 +414,43 @@ class SettingsPage(QWidget):
         )
         self._health_lbl.setText(txt)
 
-    def _create_console_batch(self) -> Path:
+    def _open_log_file(self) -> None:
         """
-        Create a temporary batch script that continuously displays the log.
-        This is much more reliable than trying to use PowerShell.
+        Open the log file with the system's default text editor.
+        Simple, reliable, no complex scripting needed.
         """
+        # Find the log file
         log_file = LOG_DIR / "combined.log"
         if not log_file.exists():
             log_file = LOG_DIR / "tracker.log"
         if not log_file.exists():
             log_file = LOG_DIR / "main.log"
 
-        # Create temp batch script
-        batch_content = f'''@echo off
-setlocal enabledelayedexpansion
-
-title Activity Monitor - Console Log
-color 0A
-cls
-
-echo.
-echo ========================================
-echo  Activity Monitor - Live Console Log
-echo ========================================
-echo.
-echo Log file: {log_file}
-echo.
-echo Updates every 2 seconds (press Ctrl+C to exit)
-echo.
-echo ========================================
-echo.
-
-:loop
-cls
-echo Activity Monitor - Console Log
-echo ========================================
-echo Updated: %date% %time%
-echo.
-powershell -NoProfile -Command "(Get-Content '{log_file}' -ErrorAction SilentlyContinue | Select-Object -Last 100) -join [Environment]::NewLine"
-echo.
-echo ========================================
-echo Press Ctrl+C to exit, window will close in 60s...
-timeout /t 2 /nobreak >nul 2>&1
-goto loop
-'''
-
-        # Write to temp file
-        try:
-            temp_fd, temp_path = tempfile.mkstemp(suffix=".bat", text=True)
-            with open(temp_fd, 'w', encoding='utf-8') as f:
-                f.write(batch_content)
-            return Path(temp_path)
-        except Exception as exc:
-            logger.error(f"Failed to create temp batch file: {exc}")
-            return None
-
-    def _toggle_console(self) -> None:
-        """
-        Toggle the console window on/off.
-        Uses a temporary batch script for better reliability.
-        """
-        with self._console_lock:
-            # If process is already running, terminate it
-            if self._console_proc is not None and self._console_proc.poll() is None:
-                try:
-                    self._console_proc.terminate()
-                    self._console_proc.wait(timeout=2)
-                except Exception as exc:
-                    logger.warning(f"Failed to terminate console: {exc}")
-                    try:
-                        self._console_proc.kill()
-                    except Exception:
-                        pass
-
-                self._console_proc = None
-
-                # Clean up temp batch file
-                if self._temp_batch_file and self._temp_batch_file.exists():
-                    try:
-                        self._temp_batch_file.unlink()
-                    except Exception:
-                        pass
-                    self._temp_batch_file = None
-
-                self._console_btn.setText("🖥  Show Console")
-                self._process_check_timer.stop()
-                logger.info("Console window closed by button click.")
-                return
-
-            # Prevent duplicate processes
-            if self._console_proc is not None and self._console_proc.poll() is None:
-                logger.warning("Console already open; ignoring duplicate request.")
-                return
-
-        # Create temporary batch script for tailing
-        batch_path = self._create_console_batch()
-        if not batch_path:
-            logger.error("Could not create console batch script.")
+        if not log_file.exists():
+            QMessageBox.warning(
+                self,
+                "Log File Not Found",
+                f"No log file found at:\n{LOG_DIR}\n\nTrigger some app activity first."
+            )
+            logger.warning(f"Log file not found at {LOG_DIR}")
             return
 
-        self._temp_batch_file = batch_path
-
-        # Launch the batch file directly (no shell wrapping)
+        # Open with default editor (notepad, notepad++, sublime, etc.)
         try:
-            # Use CreationFlags=0x08000000 to launch in new window without blocking
-            self._console_proc = subprocess.Popen(
-                [str(batch_path)],
-                creationflags=0x08000000,  # CREATE_NEW_WINDOW
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            self._console_btn.setText("🖥  Hide Console")
-            logger.info(f"Console opened with batch script: {batch_path.name}")
-            # Start periodic check to detect manual window close
-            self._process_check_timer.start(1000)  # check every 1 second
+            if Path(log_file).exists():
+                # Use os.startfile on Windows (simplest, most reliable)
+                import os
+                os.startfile(str(log_file))
+                logger.info(f"Opened log file: {log_file}")
+            else:
+                QMessageBox.warning(self, "Error", f"Log file not found:\n{log_file}")
         except Exception as exc:
-            logger.error(f"Failed to open console: {exc}")
-            self._console_proc = None
-            if self._temp_batch_file and self._temp_batch_file.exists():
-                try:
-                    self._temp_batch_file.unlink()
-                except Exception:
-                    pass
-                self._temp_batch_file = None
-
-    def _check_console_process(self) -> None:
-        """
-        Periodic check: if the console process dies (user closed the window),
-        update the button state to reflect reality.
-        """
-        with self._console_lock:
-            if self._console_proc is None:
-                self._process_check_timer.stop()
-                return
-
-            # poll() returns None if process is still alive, exit code otherwise
-            if self._console_proc.poll() is not None:
-                # Process is dead; user closed the window
-                self._console_proc = None
-
-                # Clean up temp batch file
-                if self._temp_batch_file and self._temp_batch_file.exists():
-                    try:
-                        self._temp_batch_file.unlink()
-                    except Exception:
-                        pass
-                    self._temp_batch_file = None
-
-                self._console_btn.setText("🖥  Show Console")
-                self._process_check_timer.stop()
-                logger.debug("Console window was closed; button state synced.")
+            logger.error(f"Failed to open log file: {exc}")
+            QMessageBox.critical(
+                self,
+                "Error Opening File",
+                f"Could not open log file:\n{exc}"
+            )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
