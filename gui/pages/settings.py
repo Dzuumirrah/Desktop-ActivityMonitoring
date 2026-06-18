@@ -289,21 +289,73 @@ class SettingsPage(QWidget):
         self._style_button(refresh_btn)
         btn_row.addWidget(refresh_btn)
 
-        self._console_btn = QPushButton("📄 View Log File")
-        self._console_btn.clicked.connect(self._open_log_file)
-        self._style_button(self._console_btn)
-        btn_row.addWidget(self._console_btn)
+        console_btn = QPushButton("Show Console")
+        console_btn.setToolTip(
+            "Open a live terminal showing this session\'s logs.\\n"
+            "Falls back to opening the .log file if unavailable."
+        )
+        console_btn.clicked.connect(self._show_console)
+        self._style_button(console_btn)
+        btn_row.addWidget(console_btn)
 
         btn_row.addStretch()
         L.addLayout(btn_row)
 
-        self._health_lbl = QLabel("Click refresh to check.")
+        self._health_lbl = QLabel("Click \'Refresh Health Info\' to check.")
         self._health_lbl.setStyleSheet(
             "color: #a6adc8; font-size: 11px; font-family: monospace;"
         )
         self._health_lbl.setWordWrap(True)
         L.addWidget(self._health_lbl)
         return g
+
+    # ── Console ───────────────────────────────────────────────────────────────
+
+    def _show_console(self) -> None:
+        """
+        Priority: open the terminal ConsoleDialog (current-session logs).
+        Fallback: open the on-disk .log file in the system text editor.
+        """
+        try:
+            from gui.widgets.console_dialog import ConsoleDialog
+            if (not hasattr(self, "_console_dlg")
+                    or self._console_dlg is None
+                    or not self._console_dlg.isVisible()):
+                self._console_dlg = ConsoleDialog(parent=self)
+            self._console_dlg.show()
+            self._console_dlg.raise_()
+            self._console_dlg.activateWindow()
+        except Exception as exc:
+            logger.warning(f"ConsoleDialog unavailable ({exc}); falling back to log file.")
+            self._open_log_file_fallback()
+
+    def _open_log_file_fallback(self) -> None:
+        """Original behaviour: open the .log file in the system text editor."""
+        import os, subprocess
+        from utils.logger import LOG_DIR
+        candidates = sorted(
+            LOG_DIR.glob("*.log"),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+        if not candidates:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.information(self, "No log files",
+                                    f"No .log files found in:\\n{LOG_DIR}")
+            return
+        log_file = LOG_DIR / "tracker.log"
+        if not log_file.exists():
+            log_file = candidates[0]
+        try:
+            import sys as _sys
+            if _sys.platform == "win32":
+                os.startfile(str(log_file))
+            elif _sys.platform == "darwin":
+                subprocess.Popen(["open", str(log_file)])
+            else:
+                subprocess.Popen(["xdg-open", str(log_file)])
+        except Exception as e:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Cannot open file", str(e))
 
     # ── Actions ───────────────────────────────────────────────────────────────
 
