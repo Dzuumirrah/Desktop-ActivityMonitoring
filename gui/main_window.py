@@ -3,7 +3,7 @@ Main application window.
 Dark-themed, sidebar navigation, stacked page content area.
 """
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel,
@@ -129,6 +129,10 @@ class NavButton(QPushButton):
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
+    _tracker_session_saved = Signal(dict)
+    _tracker_idle_changed = Signal(bool, object)
+    _sync_status_changed = Signal(object, object)
+
     def __init__(self, tracker=None, sync_engine=None) -> None:
         super().__init__()
         self._tracker       = tracker
@@ -297,29 +301,41 @@ class MainWindow(QMainWindow):
             self._tracker_dot.setText("  🔴 Tracker offline")
             return
 
+        self._tracker_session_saved.connect(self._handle_tracker_session_saved)
+        self._tracker_idle_changed.connect(self._handle_tracker_idle_changed)
+        self._sync_status_changed.connect(self._status_bar.set_sync_status)
+
         def on_session(data: dict) -> None:
-            self._page_dashboard.on_session_saved(data)
-            self._page_timeline.on_session_saved(data)
+            self._tracker_session_saved.emit(data)
 
         def on_idle(is_idle: bool, reason) -> None:
-            self._status_bar.set_idle(is_idle, reason)
-            if is_idle:
-                self._tracker_dot.setText("  🟡 Idle")
-                self._tracker_dot.setStyleSheet(
-                    "color: #f9e2af; font-size: 10px; padding: 8px 12px;"
-                )
-            else:
-                self._tracker_dot.setText("  🟢 Tracker running")
-                self._tracker_dot.setStyleSheet(
-                    "color: #a6e3a1; font-size: 10px; padding: 8px 12px;"
-                )
+            self._tracker_idle_changed.emit(is_idle, reason)
 
         self._tracker.on_session_saved = on_session
         self._tracker.on_idle_changed  = on_idle
 
         if self._sync_engine:
             self._sync_engine.set_status_callback(
-                lambda status, n: self._status_bar.set_sync_status(status, n)
+                lambda status, n: self._sync_status_changed.emit(status, n)
+            )
+
+    @Slot(dict)
+    def _handle_tracker_session_saved(self, data: dict) -> None:
+        self._page_dashboard.on_session_saved(data)
+        self._page_timeline.on_session_saved(data)
+
+    @Slot(bool, object)
+    def _handle_tracker_idle_changed(self, is_idle: bool, reason) -> None:
+        self._status_bar.set_idle(is_idle, reason)
+        if is_idle:
+            self._tracker_dot.setText("  🟡 Idle")
+            self._tracker_dot.setStyleSheet(
+                "color: #f9e2af; font-size: 10px; padding: 8px 12px;"
+            )
+        else:
+            self._tracker_dot.setText("  🟢 Tracker running")
+            self._tracker_dot.setStyleSheet(
+                "color: #a6e3a1; font-size: 10px; padding: 8px 12px;"
             )
 
     # ── Clean shutdown ────────────────────────────────────────────────────────

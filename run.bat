@@ -27,11 +27,17 @@ if not exist ".venv\" (
 
 REM Activate venv
 call .venv\Scripts\activate.bat
+:CHECK_CONNECTION
+ping -n 1 8.8.8.8 | find "TTL=" > nul
 
-REM Install / upgrade dependencies
-echo [SETUP] Installing dependencies…
-pip install --quiet --upgrade pip
-pip install --quiet -r requirements.txt
+IF %ERRORLEVEL% EQU 0 (
+    REM Install / upgrade dependencies
+    echo [SETUP] Installing dependencies…
+    pip install --quiet --upgrade pip
+    pip install --quiet -r requirements.txt
+) ELSE (
+    echo No internet acsess. Using already installed libraries.
+)
 
 REM Launch
 echo [START] Launching Activity Monitor…

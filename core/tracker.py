@@ -8,6 +8,17 @@ Responsibilities:
   - Apply privacy rules before persistence
   - Ping health check every 60 s
   - Emit Qt signals so the GUI updates in real-time
+
+Idle handling (revised)
+-----------------------
+When idle is detected the active session is LEFT OPEN.  Only the idle
+gap itself is recorded as a separate is_idle=True row when the user
+returns.  This means active sessions are never split by idle timeouts;
+the session's duration includes idle gaps but idle time is separately
+queryable via the is_idle column.
+
+Sleep / wake still closes and reopens sessions because the machine is
+powered down and gaps can be many hours.
 """
 
 import socket
@@ -51,7 +62,14 @@ class ActivityTracker:
         self._last_health_ping    = 0.0
         self._last_settings_check = time.time()
 
-        # Session continuation after idle / wake
+        # Idle gap recording: track start of idle period so we can write
+        # the gap as a single is_idle=True row when the user returns.
+        self._idle_start:       Optional[datetime] = None
+        self._idle_last_reason: Optional[str]      = None
+        # Window at the moment idle began (used to associate the idle record)
+        self._idle_window:      Optional[WindowInfo] = None
+
+        # Session continuation after sleep / wake only
         self._last_closed_window: Optional[WindowInfo] = None
         self._last_closed_end:    Optional[datetime]   = None
         self._just_resumed:       bool                 = False
@@ -113,47 +131,50 @@ class ActivityTracker:
         """
         Called just before the system suspends.
 
-        Saves the active session with the correct end_time so sleep
-        time is never included in session duration.  Sets idle_active
-        to True so the polling loop stays quiet until _on_wake().
+        Saves the active session so sleep time is not included in its
+        duration.  Sleep gaps can be many hours so we still close here
+        (unlike short idle timeouts which leave the session open).
         """
         logger.info(f"System going to {reason} — saving active session.")
         closed = self._session_mgr.force_close()
+        now = datetime.now()
         if closed:
-            end_now = datetime.now()
             self._persist_session(
-                closed.window, closed.start_time, end_now,
+                closed.window, closed.start_time, now,
                 is_idle=False, idle_reason=None,
             )
             self._last_closed_window = closed.window
-            self._last_closed_end    = end_now
+            self._last_closed_end    = now
 
-        self._sleep_start  = datetime.now()
+        self._sleep_start  = now
         self._sleep_reason = reason
-        # Suppress tracking while asleep
         self._idle_active  = True
 
     def _on_wake(self) -> None:
         """
         Called just after the system resumes from sleep / hibernate.
 
-        Resets idle state so tracking restarts on the next tick.
-        If the same window is foregrounded the session continues
-        seamlessly (no gap in the timeline).
+        Records the sleep gap as an idle session then resets so tracking
+        restarts on the next tick.
         """
         now = datetime.now()
         if self._sleep_start:
             dur = int((now - self._sleep_start).total_seconds())
-            logger.info(
-                f"System woke after {dur}s of "
-                f"{self._sleep_reason or 'sleep'}."
-            )
+            logger.info(f"System woke after {dur}s of {self._sleep_reason or 'sleep'}.")
+            # Persist the sleep gap as an idle record
+            if self._last_closed_window:
+                self._persist_session(
+                    self._last_closed_window,
+                    self._sleep_start,
+                    now,
+                    is_idle=True,
+                    idle_reason=self._sleep_reason or "sleep",
+                )
+
         self._sleep_start  = None
         self._sleep_reason = None
-
         self._idle_active  = False
         self._idle_detector.reset()
-        # Attempt session continuation with the first window seen after wake
         self._just_resumed = True
 
         logger.info("Tracker resumed after system wake.")
@@ -163,24 +184,19 @@ class ActivityTracker:
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def _run_loop(self) -> None:
-        """
-        Polling loop.  poll_sec is read on every iteration so a change
-        to settings['polling_interval'] applies without a restart.
-        """
         while not self._stop_event.is_set():
             try:
                 if not self._paused:
                     self._tick()
             except Exception as exc:
                 logger.error(f"Tracker tick error: {exc}", exc_info=True)
-            # ── Live settings read (Issue 1 fix) ──────────────────────────────
             poll_sec = settings.get("polling_interval", 1)
             self._stop_event.wait(timeout=poll_sec)
 
     def _tick(self) -> None:
         now = time.monotonic()
 
-        # ── Live settings reload (idle_timeout) ───────────────────────────────
+        # ── Live settings reload ──────────────────────────────────────────────
         if now - self._last_settings_check > 10:
             new_idle = settings.get("idle_timeout", 300)
             if new_idle != self._idle_detector._threshold:
@@ -203,46 +219,51 @@ class ActivityTracker:
 
             if is_idle:
                 # ── Going idle ────────────────────────────────────────────────
-                # Close the current session and mark it as ACTIVE (not idle).
-                # The session was real work; it just ended because the user
-                # stopped providing input.  Marking it is_idle=True would hide
-                # it from all dashboard statistics — that was the original bug.
-                closed = self._session_mgr.force_close()
-                if closed:
-                    end_now = datetime.now()
-                    self._persist_session(
-                        closed.window, closed.start_time, end_now,
-                        is_idle=False,   # session was real work
-                        idle_reason=None,
-                    )
-                    self._last_closed_window = closed.window
-                    self._last_closed_end    = end_now
+                # Do NOT close the active session.  Just record when idle
+                # started and which window was active so we can write the
+                # gap record when the user returns.
+                self._idle_start       = datetime.now()
+                self._idle_last_reason = reason
+                # Snapshot the current window for the idle record
+                current = self._session_mgr.current
+                self._idle_window = current.window if current else None
                 return
 
             else:
-                # Flag for session continuation check on the next window poll
-                self._just_resumed = True
-
-        if is_idle:
-            return
-
+                # ── Returning from idle ───────────────────────────────────────
+                # Persist the idle gap as its own row.
+                if self._idle_start is not None:
+                    idle_end = datetime.now()
+                    # Prefer the window that was active when idle started;
+                    # fall back to whatever is current now.
+                    win = self._idle_window or (
+                        self._session_mgr.current.window
+                        if self._session_mgr.current else None
+                    )
+                    if win:
+                        self._persist_session(
+                            win,
+                            self._idle_start,
+                            idle_end,
+                            is_idle=True,
+                            idle_reason=self._idle_last_reason,
+                        )
+                self._idle_start       = None
+                self._idle_last_reason = None
+                self._idle_window      = None
+                # Active session was never closed — no resume needed.
+                
         # ── Window sampling ───────────────────────────────────────────────────
         win_info: Optional[WindowInfo] = get_active_window()
         if not win_info:
-            self._just_resumed = False
             return
 
         if not privacy_manager.should_track(win_info.process_name):
-            self._just_resumed = False
             return
 
         closed, new_started = self._session_mgr.update(win_info)
 
-        # ── Session continuation after idle ───────────────────────────────────
-        # If the user comes back to the exact same window they were in before
-        # idle (same process + same title), resume from where the last session
-        # ended rather than starting a new session from "now".  This avoids
-        # chopping a single long activity into many 300-s stubs.
+        # ── Session continuation after sleep / wake ───────────────────────────
         if self._just_resumed:
             self._just_resumed = False
             if (new_started
@@ -253,7 +274,7 @@ class ActivityTracker:
                 self._session_mgr.resume_from(self._last_closed_end)
                 self._last_closed_window = None
                 logger.info(
-                    f"Session continued: [{win_info.process_name}] "
+                    f"Session continued after wake: [{win_info.process_name}] "
                     f"{win_info.window_title[:50]!r}"
                 )
 
@@ -272,10 +293,6 @@ class ActivityTracker:
     ) -> None:
         duration = (end_time - start_time).total_seconds()
 
-        # Filter out noisy micro-sessions (quick desktop switches, search bar
-        # flashes, tray-overflow popups, etc.).  5 s is the sweet spot:
-        # short enough to capture intentional brief app use, long enough to
-        # discard window-management artefacts.
         if duration < self._MIN_SESSION_SEC:
             logger.debug(
                 f"Skipping short session ({duration:.1f}s < {self._MIN_SESSION_SEC}s): "
@@ -313,8 +330,9 @@ class ActivityTracker:
 
         saved = self._db.insert_activity(data)
         if saved:
+            tag = "IDLE" if is_idle else "ACTIVE"
             logger.info(
-                f"Saved: [{window.process_name}] {safe_title[:60]!r} "
+                f"Saved [{tag}]: [{window.process_name}] {safe_title[:60]!r} "
                 f"({int(duration)}s)"
             )
             if self.on_session_saved:
